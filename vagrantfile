@@ -1,0 +1,152 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  # Base box configuration
+  config.vm.box = "ubuntu/jammy64"
+  
+  # Define the cluster nodes
+  nodes = [
+    { name: "esnode1", ip: "192.168.56.11" },
+    { name: "esnode2", ip: "192.168.56.12" },
+    { name: "esnode3", ip: "192.168.56.13" }
+  ]
+  
+  nodes.each_with_index do |node, index|
+    config.vm.define node[:name] do |es_node|
+      # Network configuration
+      es_node.vm.network "private_network", ip: node[:ip]
+      es_node.vm.hostname = node[:name]
+      
+      # VM resource configuration
+      es_node.vm.provider "virtualbox" do |vb|
+        vb.name = node[:name]
+        vb.memory = "1024"
+        vb.cpus = 1
+        # Disable GUI
+        vb.gui = false
+      end
+      
+      # Provisioning script
+      es_node.vm.provision "shell", inline: <<-SHELL
+        # Update system
+        apt-get update -y
+        
+        # Install Java 11
+        apt-get install -y openjdk-11-jdk curl gpg
+        
+        # Verify Java installation
+        java -version
+        
+        # Add Elasticsearch repository
+        curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elastic.gpg
+        echo "deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" > /etc/apt/sources.list.d/elastic-8.x.list
+        
+        # Update package list and install Elasticsearch
+        apt-get update -y
+        apt-get install -y elasticsearch
+        
+        # Remove any existing SSL keystore passwords
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.transport.ssl.keystore.secure_password 2>/dev/null || true
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.transport.ssl.truststore.secure_password 2>/dev/null || true
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.http.ssl.keystore.secure_password 2>/dev/null || true
+        /usr/share/elasticsearch/bin/elasticsearch-keystore remove xpack.security.http.ssl.truststore.secure_password 2>/dev/null || true
+        
+        # Create Elasticsearch configuration
+        cat > /etc/elasticsearch/elasticsearch.yml << EOF
+# Cluster configuration
+cluster.name: dev-es-cluster
+node.name: #{node[:name]}
+
+# Network configuration
+network.host: 0.0.0.0
+transport.host: #{node[:ip]}
+http.port: 9200
+transport.port: 9300
+
+# Discovery configuration
+discovery.seed_hosts: ["192.168.56.11:9300", "192.168.56.12:9300", "192.168.56.13:9300"]
+cluster.initial_master_nodes: ["es-node1", "es-node2", "es-node3"]
+
+# Disable X-Pack security completely
+xpack.security.enabled: false
+xpack.security.enrollment.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+
+# Performance settings
+bootstrap.memory_lock: false
+
+# Path settings
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+
+# Node settings
+node.roles: [ master, data, ingest ]
+EOF
+        
+        # Configure JVM settings by adding parameters to jvm.options.d directory
+        # This is the recommended approach instead of modifying the main jvm.options file
+        mkdir -p /etc/elasticsearch/jvm.options.d
+        cat > /etc/elasticsearch/jvm.options.d/custom-heap.options << EOF
+# Custom heap size settings
+-Xms512m
+-Xmx512m
+EOF
+        
+        # Set proper permissions
+        chown -R elasticsearch:elasticsearch /etc/elasticsearch
+        chown -R elasticsearch:elasticsearch /var/lib/elasticsearch
+        chown -R elasticsearch:elasticsearch /var/log/elasticsearch
+        
+        # Set file permissions
+        chmod 750 /etc/elasticsearch
+        chmod 640 /etc/elasticsearch/elasticsearch.yml
+        chmod 640 /etc/elasticsearch/jvm.options.d/custom-heap.options
+        
+        # Enable Elasticsearch service
+        systemctl daemon-reload
+        systemctl enable elasticsearch
+        
+        echo "Elasticsearch installed and configured on #{node[:name]}"
+      SHELL
+      
+      # Start services in the correct order with delays
+      if index == 0  # First node (es-node1)
+        es_node.vm.provision "shell", inline: <<-SHELL
+          echo "Starting Elasticsearch on #{node[:name]} (master node)"
+          systemctl start elasticsearch
+          sleep 10
+          systemctl status elasticsearch
+        SHELL
+      elsif index == 1  # Second node (es-node2)
+        es_node.vm.provision "shell", inline: <<-SHELL
+          echo "Waiting 30 seconds before starting #{node[:name]}..."
+          sleep 30
+          echo "Starting Elasticsearch on #{node[:name]}"
+          systemctl start elasticsearch
+          sleep 10
+          systemctl status elasticsearch
+        SHELL
+      else  # Third node (es-node3)
+        es_node.vm.provision "shell", inline: <<-SHELL
+          echo "Waiting 60 seconds before starting #{node[:name]}..."
+          sleep 60
+          echo "Starting Elasticsearch on #{node[:name]}"
+          systemctl start elasticsearch
+          sleep 100
+          systemctl status elasticsearch
+          
+          echo "Waiting for cluster to stabilize..."
+          sleep 30
+          
+          echo "Checking cluster health..."
+          curl -X GET "localhost:9200/_cluster/health?pretty" || echo "Cluster not ready yet"
+          
+          echo "Checking cluster nodes..."
+          curl -X GET "localhost:9200/_cat/nodes?v" || echo "Nodes not ready yet"
+        SHELL
+      end
+    end
+  end
+end
